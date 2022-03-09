@@ -150,10 +150,11 @@ func GetEntrySize(node *html.Node, entrySize *int64) bool {
 	}
 	data := node.FirstChild.Data
 
-	if !strings.HasSuffix(data, " KB") {
-		return false
+	isKb := false
+	if strings.HasSuffix(data, " KB") {
+		data = data[:len(data)-3]
+		isKb = true
 	}
-	data = data[:len(data)-3]
 
 	i, err := strconv.ParseInt(data, 10, 64)
 	if err != nil {
@@ -161,6 +162,9 @@ func GetEntrySize(node *html.Node, entrySize *int64) bool {
 	}
 
 	*entrySize = i
+	if isKb {
+		*entrySize *= 1000
+	}
 
 	return true
 }
