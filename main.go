@@ -25,7 +25,7 @@ const (
 	FolderParentEntry           = 2
 )
 
-var baseUrl string
+var hostUrl string
 
 var threads int64 = 0
 
@@ -34,6 +34,24 @@ var urlFile *os.File
 var urlFileMtx sync.Mutex
 
 var wg sync.WaitGroup
+
+func getDownloadPath(fileUrl string) (string, error) {
+	u, err := url.Parse(fileUrl)
+	if err != nil {
+		return "", err
+	}
+
+	parts := []string{"downloads"}
+
+	for _, str := range strings.Split(u.Path, "/") {
+		str = strings.TrimSpace(str)
+		if len(str) > 0 {
+			parts = append(parts, str)
+		}
+	}
+
+	return strings.Join(parts, "/"), nil
+}
 
 func GetFileSize(name string) (int64, error) {
 	stat, err := os.Stat(name)
@@ -206,11 +224,7 @@ func ParseEntry(node *html.Node) {
 		return
 	}
 
-	if entryPath[0] == '/' {
-		entryPath = entryPath[1:]
-	}
-
-	entryUrl := baseUrl + entryPath
+	entryUrl := hostUrl + entryPath
 	if entryType == FolderEntry {
 		crawlDirectoryAsync(entryUrl)
 	} else {
@@ -225,12 +239,10 @@ func writeUrl(fileUrl string) {
 	urlFile.WriteString(fileUrl + "\n")
 }
 func downloadUrl(fileUrl string, downloadSize int64) {
-	fileName, err := url.QueryUnescape(fileUrl[25:])
+	fileName, err := getDownloadPath(fileUrl)
 	if err != nil {
 		return
 	}
-
-	fileName = "downloads/" + fileName
 
 	folder := filepath.Dir(fileName)
 	if os.MkdirAll(folder, os.ModePerm) != nil {
@@ -268,12 +280,14 @@ func downloadUrl(fileUrl string, downloadSize int64) {
 
 	for {
 		n, err := resp.Body.Read(buffer)
-		if err == io.EOF {
-			return
-		} else if err != nil {
-			fmt.Printf("%s: %s\n", fileName, err.Error())
-			os.Remove(fileName)
-			return
+		if err != nil {
+			if err == io.EOF {
+				return
+			} else {
+				fmt.Printf("%s: %s\n", fileName, err.Error())
+				os.Remove(fileName)
+				return
+			}
 		}
 
 		if n != 4096 {
@@ -378,10 +392,19 @@ func main() {
 		return
 	}
 
-	baseUrl = os.Args[1]
-	if baseUrl[len(baseUrl)-1] != '/' {
-		baseUrl = baseUrl + "/"
+	requestUrl, err := url.Parse(os.Args[1])
+	if err != nil {
+		printUsage()
+		println("Error: 1st argument: " + err.Error())
+		return
 	}
+	if requestUrl.Scheme != "http" && requestUrl.Scheme != "https" {
+		printUsage()
+		println("Error: 1st argument is not a http or https url!")
+		return
+	}
+
+	hostUrl = requestUrl.Scheme + "://" + requestUrl.Host
 
 	writeUrlOnly, err = strconv.ParseBool(os.Args[2])
 	if err != nil {
@@ -397,7 +420,7 @@ func main() {
 	}
 	defer urlFile.Close()
 
-	crawlDirectory(baseUrl)
+	crawlDirectory(requestUrl.String())
 	time.Sleep(time.Second)
 	wg.Wait()
 

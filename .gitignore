@@ -19,3 +19,7 @@ vendor/
 
 # Go workspace file
 go.work
+
+# h5ai-dl generated files
+urls.txt
+downloads/
