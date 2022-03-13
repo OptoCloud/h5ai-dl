@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -25,8 +26,9 @@ const (
 	FolderParentEntry           = 2
 )
 
-var hostUrl string
+var hostUrl url.URL
 
+var maxThreads int64
 var threads int64 = 0
 
 var writeUrlOnly bool
@@ -35,15 +37,15 @@ var urlFileMtx sync.Mutex
 
 var wg sync.WaitGroup
 
-func getDownloadPath(fileUrl string) (string, error) {
-	u, err := url.Parse(fileUrl)
-	if err != nil {
-		return "", err
-	}
-
+func getDownloadPath(entryPath string) (string, error) {
 	parts := []string{"downloads"}
 
-	for _, str := range strings.Split(u.Path, "/") {
+	for _, str := range strings.Split(entryPath, "/") {
+		str, err := url.PathUnescape(str)
+		if err != nil {
+			return "", err
+		}
+
 		str = strings.TrimSpace(str)
 		if len(str) > 0 {
 			parts = append(parts, str)
@@ -51,6 +53,10 @@ func getDownloadPath(fileUrl string) (string, error) {
 	}
 
 	return strings.Join(parts, "/"), nil
+}
+func getDownloadUrl(entryHost url.URL, entryPath string) string {
+	entryHost.Path = entryPath
+	return entryHost.String()
 }
 
 func GetFileSize(name string) (int64, error) {
@@ -224,11 +230,10 @@ func ParseEntry(node *html.Node) {
 		return
 	}
 
-	entryUrl := hostUrl + entryPath
 	if entryType == FolderEntry {
-		crawlDirectoryAsync(entryUrl)
+		crawlDirectoryAsync(entryPath)
 	} else {
-		saveContentAsync(entryUrl, entrySize)
+		saveContentAsync(entryPath, entrySize)
 	}
 }
 
@@ -238,8 +243,8 @@ func writeUrl(fileUrl string) {
 
 	urlFile.WriteString(fileUrl + "\n")
 }
-func downloadUrl(fileUrl string, downloadSize int64) {
-	fileName, err := getDownloadPath(fileUrl)
+func downloadUrl(entryPath string, downloadSize int64) {
+	fileName, err := getDownloadPath(entryPath)
 	if err != nil {
 		return
 	}
@@ -249,25 +254,29 @@ func downloadUrl(fileUrl string, downloadSize int64) {
 		return
 	}
 
+	nThreads := atomic.LoadInt64(&threads)
+
 	// Verify file integrity
 	fileSize, err := GetFileSize(fileName)
 	if err == nil {
 		if fileSize == downloadSize {
-			fmt.Printf("Intact      ### %s\n", fileName)
+			fmt.Printf("[%03d] Intact        # %s\n", nThreads, fileName)
 			return
 		}
-		fmt.Printf("Damaged     ### %s\n", fileName)
+		fmt.Printf("[%03d] Damaged       # %s\n", nThreads, fileName)
 		os.Remove(fileName)
 	}
 
-	fmt.Printf("Downloading ### %s\n", fileUrl)
-	resp, err := http.Get(fileUrl)
+	entryUrl := getDownloadUrl(hostUrl, entryPath)
+
+	fmt.Printf("[%03d] Downloading   # %s\n", nThreads, entryUrl)
+	resp, err := http.Get(entryUrl)
 	if err != nil {
 		fmt.Printf("Error: %v\n", err)
 		return
 	}
 
-	fmt.Printf("Saving      ### %s\n", fileName)
+	fmt.Printf("[%03d] Saving        # %s\n", nThreads, fileName)
 	file, err := os.Create(fileName)
 	if err != nil {
 		fmt.Printf("%s: %s\n", fileName, err.Error())
@@ -284,7 +293,7 @@ func downloadUrl(fileUrl string, downloadSize int64) {
 			if err == io.EOF {
 				return
 			} else {
-				fmt.Printf("%s: %s\n", fileName, err.Error())
+				fmt.Printf("[%03d] ERROR         # %s: %s\n", nThreads, fileName, err.Error())
 				os.Remove(fileName)
 				return
 			}
@@ -296,7 +305,7 @@ func downloadUrl(fileUrl string, downloadSize int64) {
 			_, err = file.Write(buffer)
 		}
 		if err != nil {
-			fmt.Printf("%s: %s\n", fileName, err.Error())
+			fmt.Printf("[%03d] ERROR         # %s: %s\n", nThreads, fileName, err.Error())
 			os.Remove(fileName)
 			return
 		}
@@ -319,8 +328,10 @@ func hasAttributeWithVal(node *html.Node, attrKey string, attrVal string) bool {
 
 	return false
 }
-func crawlDirectory(url string) {
-	resp, err := http.Get(url)
+func crawlDirectory(entryPath string) {
+	entryUrl := getDownloadUrl(hostUrl, entryPath)
+
+	resp, err := http.Get(entryUrl)
 	if err != nil {
 		fmt.Printf("Error: %v\n", err)
 		return
@@ -344,50 +355,46 @@ func crawlDirectory(url string) {
 	}
 	f(doc)
 }
-func saveContentAsync(url string, optionalFileSize int64) {
+func saveContentAsync(entryPath string, optionalFileSize int64) {
 	f_async := func() {
 		wg.Add(1)
 		defer wg.Done()
-		saveContent(url, optionalFileSize)
+		saveContent(entryPath, optionalFileSize)
 		atomic.AddInt64(&threads, -1)
 	}
 	nThreads := atomic.AddInt64(&threads, 1)
-	if nThreads <= 12 {
-		fmt.Printf("Launching thread %v\n", nThreads)
-
+	if nThreads <= maxThreads {
 		go f_async()
 	} else {
 		atomic.AddInt64(&threads, -1)
-		saveContent(url, optionalFileSize)
+		saveContent(entryPath, optionalFileSize)
 	}
 }
-func crawlDirectoryAsync(url string) {
+func crawlDirectoryAsync(entryPath string) {
 	f_async := func() {
 		wg.Add(1)
 		defer wg.Done()
-		crawlDirectory(url)
+		crawlDirectory(entryPath)
 		atomic.AddInt64(&threads, -1)
 	}
 	nThreads := atomic.AddInt64(&threads, 1)
-	if nThreads <= 12 {
-		fmt.Printf("Launching thread %v\n", nThreads)
+	if nThreads <= maxThreads {
 		go f_async()
 	} else {
 		atomic.AddInt64(&threads, -1)
-		crawlDirectory(url)
+		crawlDirectory(entryPath)
 	}
 }
 
 func printUsage() {
-	println("Usage: h5ai-dl.exe [1] [2]")
+	println("Usage: h5ai-dl.exe [1] [2] [3]")
 	println("    1: A url for a h5ai hsoted website")
 	println("    2: Only save urls, and dont download files? (1, t, T, TRUE, true, True / 0, f, F, FALSE, false, False)")
+	println("    3: [OPTIONAL] Amount of threads to use, defaults to CPU core count")
 }
 
 func main() {
-	var err error
-
-	if len(os.Args) != 3 {
+	if len(os.Args) < 3 {
 		printUsage()
 		return
 	}
@@ -404,13 +411,27 @@ func main() {
 		return
 	}
 
-	hostUrl = requestUrl.Scheme + "://" + requestUrl.Host
+	hostUrl = *requestUrl
+	hostUrl.Path = ""
+
+	requestPath := requestUrl.Path
 
 	writeUrlOnly, err = strconv.ParseBool(os.Args[2])
 	if err != nil {
 		printUsage()
 		println("Error: 2nd argument: " + err.Error())
 		return
+	}
+
+	if len(os.Args) > 3 {
+		maxThreads, err = strconv.ParseInt(os.Args[3], 10, 64)
+		if err != nil {
+			printUsage()
+			println("Error: 3rd argument: " + err.Error())
+			return
+		}
+	} else {
+		maxThreads = int64(runtime.NumCPU())
 	}
 
 	urlFile, err = os.Create("urls.txt")
@@ -420,7 +441,7 @@ func main() {
 	}
 	defer urlFile.Close()
 
-	crawlDirectory(requestUrl.String())
+	crawlDirectory(requestPath)
 	time.Sleep(time.Second)
 	wg.Wait()
 
