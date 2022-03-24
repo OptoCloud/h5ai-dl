@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -13,17 +15,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"golang.org/x/net/html"
-)
-
-type EntryType int
-
-const (
-	InvalidEntry      EntryType = -1
-	FileEntry                   = 0
-	FolderEntry                 = 1
-	FolderParentEntry           = 2
 )
 
 var hostUrl url.URL
@@ -67,183 +58,13 @@ func GetFileSize(name string) (int64, error) {
 	return 0, err
 }
 
-func getSubNodes(node *html.Node, nodeKey string) []*html.Node {
-	var nodes = make([]*html.Node, 0)
-
-	if node != nil {
-		for child := node.FirstChild; child != nil; child = child.NextSibling {
-			if child.Data == nodeKey {
-				nodes = append(nodes, child)
-			}
-		}
-
-	}
-
-	return nodes
-}
-func getAttribute(node *html.Node, attrKey string) *html.Attribute {
-	if node != nil {
-		for _, attribute := range node.Attr {
-			if attribute.Key == attrKey {
-				return &attribute
-			}
-		}
-	}
-
-	return nil
-}
-
-func GetEntryType(node *html.Node, entryType *EntryType) bool {
-	*entryType = InvalidEntry
-
-	if node == nil {
-		return false
-	}
-	if node.FirstChild == nil {
-		return false
-	}
-	if node.FirstChild.Data != "img" {
-		return false
-	}
-
-	altAttr := getAttribute(node.FirstChild, "alt")
-	if altAttr == nil {
-		return false
-	}
-
-	switch altAttr.Val {
-	case "file":
-		*entryType = FileEntry
-	case "folder":
-		*entryType = FolderEntry
-	case "folder-parent":
-		*entryType = FolderParentEntry
-	}
-
-	return *entryType != InvalidEntry
-}
-func GetEntryPath(node *html.Node, entryPath *string) bool {
-	*entryPath = ""
-
-	if node == nil {
-		return false
-	}
-	if node.FirstChild == nil {
-		return false
-	}
-	if node.FirstChild.Data != "a" {
-		return false
-	}
-
-	altAttr := getAttribute(node.FirstChild, "href")
-	if altAttr == nil {
-		return false
-	}
-
-	*entryPath = altAttr.Val
-
-	return true
-}
-func GetEntryTime(node *html.Node, entryTime *time.Time) bool {
-	*entryTime = time.Time{}
-
-	if node == nil {
-		return false
-	}
-	if node.FirstChild == nil {
-		return false
-	}
-	data := node.FirstChild.Data
-	t, err := time.Parse("2006-01-02 15:04", data)
-	if err != nil {
-		return false
-	}
-
-	*entryTime = t
-
-	return true
-}
-func GetEntrySize(node *html.Node, entrySize *int64) bool {
-	*entrySize = 0
-
-	if node == nil {
-		return false
-	}
-	if node.FirstChild == nil {
-		return false
-	}
-	data := node.FirstChild.Data
-
-	isKb := false
-	if strings.HasSuffix(data, " KB") {
-		data = data[:len(data)-3]
-		isKb = true
-	}
-
-	i, err := strconv.ParseInt(data, 10, 64)
-	if err != nil {
-		return false
-	}
-
-	*entrySize = i
-	if isKb {
-		*entrySize *= 1000
-	}
-
-	return true
-}
-func ParseEntry(node *html.Node) {
-	if node == nil {
-		return
-	}
-
-	var entryType EntryType = InvalidEntry
-	var entryPath string
-	var entryTime time.Time
-	var entrySize int64
-
-	for _, tdNode := range getSubNodes(node, "td") {
-		classAttr := getAttribute(tdNode, "class")
-		if classAttr == nil {
-			return
-		}
-
-		parseResult := false
-
-		switch classAttr.Val {
-		case "fb-i":
-			parseResult = GetEntryType(tdNode, &entryType)
-		case "fb-n":
-			parseResult = GetEntryPath(tdNode, &entryPath)
-		case "fb-d":
-			parseResult = GetEntryTime(tdNode, &entryTime)
-		case "fb-s":
-			parseResult = GetEntrySize(tdNode, &entrySize)
-		}
-
-		if !parseResult {
-			return
-		}
-	}
-
-	if entryType == InvalidEntry || entryType == FolderParentEntry {
-		return
-	}
-
-	if entryType == FolderEntry {
-		crawlDirectoryAsync(entryPath)
-	} else {
-		saveContentAsync(entryPath, entrySize)
-	}
-}
-
 func writeUrl(fileUrl string) {
 	urlFileMtx.Lock()
 	defer urlFileMtx.Unlock()
 
 	urlFile.WriteString(fileUrl + "\n")
 }
-func downloadUrl(entryPath string, downloadSize int64) {
+func downloadUrl(entryPath string, downloadSize int64, modifiedTime uint64) {
 	fileName, err := getDownloadPath(entryPath)
 	if err != nil {
 		return
@@ -311,55 +132,78 @@ func downloadUrl(entryPath string, downloadSize int64) {
 		}
 	}
 }
-func saveContent(fileUrl string, downloadSize int64) {
+func saveContent(fileUrl string, downloadSize int64, modifiedTime uint64) {
 	writeUrl(fileUrl)
 	if !writeUrlOnly {
-		downloadUrl(fileUrl, downloadSize)
+		downloadUrl(fileUrl, downloadSize, modifiedTime)
 	}
 }
-func hasAttributeWithVal(node *html.Node, attrKey string, attrVal string) bool {
-	if node != nil {
-		for _, attribute := range node.Attr {
-			if attribute.Key == attrKey && attribute.Val == attrVal {
-				return true
-			}
-		}
+
+type FileEntry struct {
+	Path string `json:"href"`
+	Time uint64 `json:"time"`
+	Size int64  `json:"size"`
+}
+
+func getFileIndex(entryPath string) ([]FileEntry, error) {
+	request := struct {
+		Action string `json:"action"`
+		Items  struct {
+			Path  string `json:"href"`
+			Depth int    `json:"what"`
+		} `json:"items"`
+	}{}
+
+	request.Action = "get"
+	request.Items.Path = entryPath
+	request.Items.Depth = 1
+
+	request_data, err := json.Marshal(request)
+	if err != nil {
+		return nil, err
 	}
 
-	return false
-}
-func crawlDirectory(entryPath string) {
-	entryUrl := getDownloadUrl(hostUrl, entryPath)
-
-	resp, err := http.Get(entryUrl)
+	resp, err := http.Post(hostUrl.String(), "application/json", bytes.NewBuffer(request_data))
 	if err != nil {
 		fmt.Printf("Error: %v\n", err)
-		return
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	fileIndex := struct {
+		Items []FileEntry `json:"items"`
+	}{}
+
+	err = json.NewDecoder(resp.Body).Decode(&fileIndex)
+	if err != nil {
+		return nil, err
 	}
 
-	doc, err := html.Parse(resp.Body)
+	return fileIndex.Items, nil
+}
+func crawlDirectory(entryPath string) {
+	fileEntries, err := getFileIndex(entryPath)
 	if err != nil {
 		return
 	}
 
-	var f func(*html.Node)
-	f = func(node *html.Node) {
-		if node.Type == html.ElementNode && node.Data == "tbody" {
-			for _, trNode := range getSubNodes(node, "tr") {
-				ParseEntry(trNode)
-			}
+	for _, entry := range fileEntries {
+		if entryPath == entry.Path || !strings.HasPrefix(entry.Path, entryPath) {
+			continue
 		}
-		for c := node.FirstChild; c != nil; c = c.NextSibling {
-			f(c)
+
+		if strings.HasSuffix(entry.Path, "/") {
+			crawlDirectoryAsync(entry.Path)
+		} else {
+			saveContentAsync(entry.Path, entry.Size, entry.Time)
 		}
 	}
-	f(doc)
 }
-func saveContentAsync(entryPath string, optionalFileSize int64) {
+func saveContentAsync(entryPath string, fileSize int64, fileTime uint64) {
 	f_async := func() {
 		wg.Add(1)
 		defer wg.Done()
-		saveContent(entryPath, optionalFileSize)
+		saveContent(entryPath, fileSize, fileTime)
 		atomic.AddInt64(&threads, -1)
 	}
 	nThreads := atomic.AddInt64(&threads, 1)
@@ -367,7 +211,7 @@ func saveContentAsync(entryPath string, optionalFileSize int64) {
 		go f_async()
 	} else {
 		atomic.AddInt64(&threads, -1)
-		saveContent(entryPath, optionalFileSize)
+		saveContent(entryPath, fileSize, fileTime)
 	}
 }
 func crawlDirectoryAsync(entryPath string) {
